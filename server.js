@@ -200,6 +200,58 @@ async function constructServer(moduleDefs) {
   app.set('trust proxy', true)
 
   /**
+   * 公开模式（默认开启）：黑名单制 —— 只封禁危险端点（登录/账号/写入类），
+   * 其余全部放行（包括 /meting、/search、/song/detail、/comment/music、
+   * /song/url/v1 等常用只读音乐接口）。
+   *
+   * 封禁类别：
+   *   登录认证    /login/*、/register*、/activate、/captcha、/sms、/verify
+   *   账号信息    /user/*（含 /user/account、/user/update 等）
+   *   云盘/声音   /cloud*、/voice*
+   *   账号操作    /daily_signin、/personal_fm、/scrobble*
+   *   私信        /msg/*
+   *   动态/社交   /event/*、/feed/*、/block/*
+   *   内部/日志   /inner/*、/log/*、/clientlog*
+   *   调试        /manhole/*
+   *   写入操作    歌单写、评论写、艺人/专辑/DJ/MV 关注、歌曲上传、资源点赞
+   *
+   * 默认即生效，适合公开音乐 API 部署。自用（需要全部端点）时设置
+   * PUBLIC_MODE=false 关闭。封禁返回 404（与未知路由表现一致）。
+   *
+   * 安全前提：/meting 内部通过 require() 直接调用模块函数（不走 HTTP 路由），
+   * 因此封禁这些端点的 HTTP 路由不影响 /meting 任何功能。
+   */
+  const PUBLIC_MODE = process.env.PUBLIC_MODE !== 'false'
+  if (PUBLIC_MODE) {
+    // 公开模式：不通过 HTTP 封禁，而是对登录路由阻止 NETEASE_COOKIE 回落
+    // （/login/refresh 等会将刷新的 MUSIC_U 写进响应体）。
+    // 用户自带 cookie 正常使用；无 cookie 时登录路由用匿名 token，不泄露配置的 cookie。
+    // 如需封禁更多端点，在此添加前缀即可。
+    const DANGER_PREFIXES = []
+    app.use((req, res, next) => {
+      const p = req.path.replace(/\/+$/, '') || '/'
+      // 静态资源（含扩展名）直接放行
+      if (p.includes('.')) return next()
+      // 检查黑名单：路径以危险前缀开头，且后接字符串结束或 “/”
+      const blocked = DANGER_PREFIXES.some(prefix =>
+        p.startsWith(prefix) && (p.length === prefix.length || p[prefix.length] === '/')
+      )
+      if (blocked) {
+        return res.status(404).json({ code: 404, data: null, msg: 'Not Found' })
+      }
+      // 其余全部放行
+      next()
+    })
+    logger.info(
+      '公开模式已启用：登录路由已保护（不回落 NETEASE_COOKIE），其余端点全部放行；自用需设置 PUBLIC_MODE=false',
+    )
+  } else {
+    logger.info(
+      '公开模式已关闭（PUBLIC_MODE=false）：全部原生端点可访问，请确保不暴露在公网',
+    )
+  }
+
+  /**
    * 调用统计中间件 —— 每个 HTTP 请求递增 api 计数器
    * 排除 /stats 自身（避免 self-reference 膨胀计数）
    * recordApi 是同步函数（Node 单线程 JS 中 fs.writeFileSync 原子安全）
@@ -341,12 +393,14 @@ async function constructServer(moduleDefs) {
         }
       })
 
+      const isLoginRoute = moduleDef.route.startsWith('/login')
       let query = Object.assign(
         {},
         { cookie: req.cookies, _req: req },
         req.query,
         req.body,
         req.files,
+        isLoginRoute ? { _skipEnvCookie: true } : {},
       )
 
       try {
